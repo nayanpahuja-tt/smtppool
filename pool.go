@@ -168,7 +168,7 @@ func (p *Pool) Send(e Email) error {
 		}
 
 		// Send the message.
-		retry, err := c.send(e)
+		retry, err := c.send(e, p.opt.DKIMOptions)
 		if err == nil {
 			_ = p.returnConn(c, nil)
 			return nil
@@ -449,7 +449,9 @@ func (p *Pool) sweepConns(interval time.Duration) {
 
 // send sends a message using the connection. The bool in the return indicates
 // if the message can be retried in case of an SMTP related error.
-func (c *conn) send(e Email) (bool, error) {
+// If dkimOpts is non-nil, the message is DKIM-signed after Bytes() is called
+// and before it is written to the SMTP DATA command — same bytes, signed once.
+func (c *conn) send(e Email, dkimOpts *dkim.SignOptions) (bool, error) {
 	c.lastActivity = time.Now()
 
 	// Combine e-mail addresses from multiple lists.
@@ -489,14 +491,22 @@ func (c *conn) send(e Email) (bool, error) {
 		}
 	}()
 
-	// Get raw message payload.
+	// Build the raw message once. The boundary is fixed for this call, so
+	// DKIM signing over these exact bytes is stable.
 	msg, err := e.Bytes()
 	if err != nil {
 		return false, err
 	}
 
-	if _, err = w.Write(msg); err != nil {
-		return canRetry(err), err
+	if dkimOpts != nil {
+		// dkim.Sign prepends DKIM-Signature and streams msg to w.
+		if err := dkim.Sign(w, bytes.NewReader(msg), dkimOpts); err != nil {
+			return false, err
+		}
+	} else {
+		if _, err = w.Write(msg); err != nil {
+			return canRetry(err), err
+		}
 	}
 
 	if err := w.Close(); err != nil {
