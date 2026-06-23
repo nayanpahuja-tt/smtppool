@@ -1,4 +1,4 @@
-module github.com/knadh/smtppool/v2
+module github.com/nayanpahuja-tt/smtppool/v2
 
 go 1.23
 
