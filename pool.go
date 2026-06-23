@@ -81,8 +81,9 @@ type Opt struct {
 	// TLSConfig is the optional TLS configuration.
 	TLSConfig *tls.Config
 
-	// DKIMOptions, if non-nil, signs every outgoing message sent via SendRaw
-	// using DKIM (go-msgauth/dkim) before writing to the SMTP DATA command.
+	// DKIMOptions, if non-nil, signs every outgoing message using DKIM
+	// (go-msgauth/dkim). Signing happens inside conn.send after Email.Bytes()
+	// is called, so the boundary is fixed and the body hash is stable.
 	DKIMOptions *dkim.SignOptions
 }
 
@@ -182,41 +183,6 @@ func (p *Pool) Send(e Email) error {
 		}
 	}
 
-	return lastErr
-}
-
-// SendRaw delivers a pre-built raw RFC 5322 message to a single envelope
-// recipient. Unlike Send, it does not build the message from an Email struct —
-// the caller provides the exact wire bytes. If Opt.DKIMOptions is set, the
-// message is DKIM-signed before transmission.
-func (p *Pool) SendRaw(envelopeFrom, rcptTo string, rawMsg []byte) error {
-	var lastErr error
-	for i := range p.opt.MaxMessageRetries {
-		if i > 0 && p.opt.MessageRetryDelay > 0 {
-			time.Sleep(p.opt.MessageRetryDelay)
-		}
-
-		c, err := p.borrowConn()
-		if err != nil {
-			lastErr = err
-			if canRetry(err) {
-				continue
-			}
-			return err
-		}
-
-		retry, err := c.sendRaw(envelopeFrom, rcptTo, rawMsg, p.opt.DKIMOptions)
-		if err == nil {
-			_ = p.returnConn(c, nil)
-			return nil
-		}
-		lastErr = err
-
-		_ = p.returnConn(c, err)
-		if !retry {
-			return err
-		}
-	}
 	return lastErr
 }
 
@@ -514,48 +480,6 @@ func (c *conn) send(e Email, dkimOpts *dkim.SignOptions) (bool, error) {
 	}
 	isClosed = true
 
-	return false, nil
-}
-
-// sendRaw delivers pre-built raw message bytes to a single recipient.
-// If dkimOpts is non-nil, the message is DKIM-signed before writing to DATA.
-func (c *conn) sendRaw(envelopeFrom, rcptTo string, rawMsg []byte, dkimOpts *dkim.SignOptions) (bool, error) {
-	c.lastActivity = time.Now()
-
-	if err := c.conn.Mail(envelopeFrom); err != nil {
-		return canRetry(err), err
-	}
-	if err := c.conn.Rcpt(rcptTo); err != nil {
-		return canRetry(err), err
-	}
-
-	w, err := c.conn.Data()
-	if err != nil {
-		return canRetry(err), err
-	}
-
-	isClosed := false
-	defer func() {
-		if !isClosed {
-			w.Close()
-		}
-	}()
-
-	if dkimOpts != nil {
-		// dkim.Sign prepends DKIM-Signature header then streams rawMsg to w.
-		if err := dkim.Sign(w, bytes.NewReader(rawMsg), dkimOpts); err != nil {
-			return false, err
-		}
-	} else {
-		if _, err := w.Write(rawMsg); err != nil {
-			return canRetry(err), err
-		}
-	}
-
-	if err := w.Close(); err != nil {
-		return false, err
-	}
-	isClosed = true
 	return false, nil
 }
 
