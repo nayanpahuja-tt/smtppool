@@ -3,6 +3,7 @@
 package smtppool
 
 import (
+	"bytes"
 	"crypto/tls"
 	"errors"
 	"fmt"
@@ -13,6 +14,8 @@ import (
 	"net/textproto"
 	"sync/atomic"
 	"time"
+
+	"github.com/emersion/go-msgauth/dkim"
 )
 
 // SSLType is the type of SSL connection to use.
@@ -27,6 +30,11 @@ const (
 
 	// SSLSTARTTLS specifies a non-TLS connection that then upgrades to STARTTLS.
 	SSLSTARTTLS
+
+	// SSLOpportunisticSTARTTLS opens a plain connection and upgrades to STARTTLS
+	// if the server supports it, without failing if STARTTLS is unavailable.
+	// Suitable for direct-to-MX delivery on port 25.
+	SSLOpportunisticSTARTTLS
 )
 
 // Opt represents SMTP pool options.
@@ -72,6 +80,10 @@ type Opt struct {
 
 	// TLSConfig is the optional TLS configuration.
 	TLSConfig *tls.Config
+
+	// DKIMOptions, if non-nil, signs every outgoing message sent via SendRaw
+	// using DKIM (go-msgauth/dkim) before writing to the SMTP DATA command.
+	DKIMOptions *dkim.SignOptions
 }
 
 // Pool represents an SMTP connection pool.
@@ -173,6 +185,41 @@ func (p *Pool) Send(e Email) error {
 	return lastErr
 }
 
+// SendRaw delivers a pre-built raw RFC 5322 message to a single envelope
+// recipient. Unlike Send, it does not build the message from an Email struct —
+// the caller provides the exact wire bytes. If Opt.DKIMOptions is set, the
+// message is DKIM-signed before transmission.
+func (p *Pool) SendRaw(envelopeFrom, rcptTo string, rawMsg []byte) error {
+	var lastErr error
+	for i := range p.opt.MaxMessageRetries {
+		if i > 0 && p.opt.MessageRetryDelay > 0 {
+			time.Sleep(p.opt.MessageRetryDelay)
+		}
+
+		c, err := p.borrowConn()
+		if err != nil {
+			lastErr = err
+			if canRetry(err) {
+				continue
+			}
+			return err
+		}
+
+		retry, err := c.sendRaw(envelopeFrom, rcptTo, rawMsg, p.opt.DKIMOptions)
+		if err == nil {
+			_ = p.returnConn(c, nil)
+			return nil
+		}
+		lastErr = err
+
+		_ = p.returnConn(c, err)
+		if !retry {
+			return err
+		}
+	}
+	return lastErr
+}
+
 // Close closes the pool.
 func (p *Pool) Close() {
 	p.closed.Store(true)
@@ -201,8 +248,8 @@ func (p *Pool) newConn() (cn *conn, err error) {
 		netCon = c
 
 	default:
-		// SSLSTARTTLS, SSLNone
-		// Non-TLS connection that may be upgraded later using STARTTLS.
+		// SSLSTARTTLS, SSLNone, SSLOpportunisticSTARTTLS
+		// Plain connection; may be upgraded later using STARTTLS.
 		c, err := net.DialTimeout("tcp", addr, p.opt.PoolWaitTimeout)
 		if err != nil {
 			return nil, err
@@ -236,6 +283,17 @@ func (p *Pool) newConn() (cn *conn, err error) {
 		}
 		if err := sm.StartTLS(p.opt.TLSConfig); err != nil {
 			return nil, err
+		}
+	}
+
+	// Opportunistic STARTTLS: upgrade if supported, continue without TLS if not.
+	if p.opt.SSL == SSLOpportunisticSTARTTLS {
+		if ok, _ := sm.Extension("STARTTLS"); ok {
+			tlsCfg := p.opt.TLSConfig
+			if tlsCfg == nil {
+				tlsCfg = &tls.Config{ServerName: p.opt.Host} //nolint:gosec
+			}
+			_ = sm.StartTLS(tlsCfg) // non-fatal: continue without TLS on error
 		}
 	}
 
@@ -446,6 +504,48 @@ func (c *conn) send(e Email) (bool, error) {
 	}
 	isClosed = true
 
+	return false, nil
+}
+
+// sendRaw delivers pre-built raw message bytes to a single recipient.
+// If dkimOpts is non-nil, the message is DKIM-signed before writing to DATA.
+func (c *conn) sendRaw(envelopeFrom, rcptTo string, rawMsg []byte, dkimOpts *dkim.SignOptions) (bool, error) {
+	c.lastActivity = time.Now()
+
+	if err := c.conn.Mail(envelopeFrom); err != nil {
+		return canRetry(err), err
+	}
+	if err := c.conn.Rcpt(rcptTo); err != nil {
+		return canRetry(err), err
+	}
+
+	w, err := c.conn.Data()
+	if err != nil {
+		return canRetry(err), err
+	}
+
+	isClosed := false
+	defer func() {
+		if !isClosed {
+			w.Close()
+		}
+	}()
+
+	if dkimOpts != nil {
+		// dkim.Sign prepends DKIM-Signature header then streams rawMsg to w.
+		if err := dkim.Sign(w, bytes.NewReader(rawMsg), dkimOpts); err != nil {
+			return false, err
+		}
+	} else {
+		if _, err := w.Write(rawMsg); err != nil {
+			return canRetry(err), err
+		}
+	}
+
+	if err := w.Close(); err != nil {
+		return false, err
+	}
+	isClosed = true
 	return false, nil
 }
 
